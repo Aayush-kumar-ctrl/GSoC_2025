@@ -1,229 +1,291 @@
-from dotenv import load_dotenv
-import os
 import json
-import google.generativeai as genai
-from google.generativeai.types import GenerationConfig
-from typing import List, Dict, Literal
-import typer
+import os
+import random
+import re
+import time
 from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
+from typing import Any, Dict, List, Literal, get_args
 
-
+import typer
+from dotenv import load_dotenv
+from litellm import completion
+from pydantic import BaseModel, ConfigDict, Field
 
 load_dotenv()
-YOUR_API_KEY = os.getenv("LLM_API_KEY")
-genai.configure(api_key=YOUR_API_KEY)
 
-class CodeReferences(BaseModel):
-    NCIt: str
-    UMLS: str
+if "USE_LITELLM_PROXY" not in os.environ:
+    YOUR_API_KEY = os.getenv("LLM_API_KEY")
+    os.environ["GOOGLE_API_KEY"] = YOUR_API_KEY
+
 
 class AssociatedPathways(BaseModel):
-    prostate_cancer_ar_signaling: Literal["yes", "no"]
-    prostate_cancer_ar_and_steroid_synthesis_enzymes: Literal["yes", "no"]
-    prostate_cancer_steroid_inactivating_genes: Literal["yes", "no"]
-    prostate_cancer_down_regulated_by_androgen: Literal["yes", "no"]
-    glioblastoma_tp53_pathway: Literal["yes", "no"]
-    glioblastoma_rtk_ras_pi3k_akt_signaling: Literal["yes", "no"]
-    glioblastoma_rb_pathway: Literal["yes", "no"]
-    general_cell_cycle_tcga_pancan_pathways: Literal["yes", "no"]
-    general_hippo_tcga_pancan_pathways: Literal["yes", "no"]
-    general_myc_tcga_pancan_pathways: Literal["yes", "no"]
-    general_notch_tcga_pancan_pathways: Literal["yes", "no"]
-    general_nrf2_tcga_pancan_pathways: Literal["yes", "no"]
-    general_pi3k_tcga_pancan_pathways: Literal["yes", "no"]
-    general_tgf_beta_tcga_pancan_pathways: Literal["yes", "no"]
-    general_rtk_ras_tcga_pancan_pathways: Literal["yes", "no"]
-    general_tp53_tcga_pancan_pathways: Literal["yes", "no"]
-    general_wnt_tcga_pancan_pathways: Literal["yes", "no"]
-    general_cell_cycle_control: Literal["yes", "no"]
-    general_p53_signaling: Literal["yes", "no"]
-    general_notch_signaling: Literal["yes", "no"]
-    general_dna_damage_response: Literal["yes", "no"]
-    general_other_growth_proliferation_signaling: Literal["yes", "no"]
-    general_survival_cell_death_regulation_signaling: Literal["yes", "no"]
-    general_telomere_maintenance: Literal["yes", "no"]
-    general_rtk_signaling_family: Literal["yes", "no"]
-    general_pi3k_akt_mtor_signaling: Literal["yes", "no"]
-    general_ras_raf_mek_erk_jnk_signaling: Literal["yes", "no"]
-    general_angiogenesis: Literal["yes", "no"]
-    general_folate_transport: Literal["yes", "no"]
-    general_invasion_and_metastasis: Literal["yes", "no"]
-    general_tgf_β_pathway: Literal["yes", "no"]
-    ovarian_cancer_oncogenes_associated_with_epithelial_ovarian_cancer: Literal["yes", "no"]
-    ovarian_cancer_putative_tumor_suppressor_genes_in_epithelial_ovarian_cancer: Literal["yes", "no"]
-    general_regulation_of_ribosomal_protein_synthesis_and_cell_growth: Literal["yes", "no"]
+    cell_cycle_pathway: Literal["yes", "no"]
+    hippo_pathway: Literal["yes", "no"]
+    myc_pathway: Literal["yes", "no"]
+    notch_pathway: Literal["yes", "no"]
+    nrf2_pathway: Literal["yes", "no"]
+    pi3k_pathway: Literal["yes", "no"]
+    tgf_beta_pathway: Literal["yes", "no"]  # fixed unicode beta issue
+    rtk_ras_pathway: Literal["yes", "no"]
+    tp53_pathway: Literal["yes", "no"]
+    wnt_pathway: Literal["yes", "no"]
 
-class GenerateLists(BaseModel):
+
+class GeneInfo(BaseModel):
+    association_strength: Literal[
+        "very strong", "strong", "moderate", "weak", "very weak"
+    ]
+    reference: str
+    mutations: List[str]
+    mutation_origin: Literal["germline/somatic", "somatic", "germline"]
+    diagnostic_implication: str
+    therapeutic_relevance: str
+
+
+class AssociatedGene(BaseModel):
+    gene_symbol: str
+    gene_info: GeneInfo
+
+
+class GenerateGeneLists(BaseModel):
     cancer_name: str
-    other_codes_used_for_data_gathering: CodeReferences
-    associated_genes: List[str]
+    associated_genes: List[AssociatedGene] = Field(
+        ..., description="List of gene symbols and their associated data"
+    )
+    model_config = ConfigDict(validate_by_name=True)
+
+
+class GeneratePathwayLists(BaseModel):
+    cancer_name: str
     associated_pathways: AssociatedPathways
+    model_config = ConfigDict(validate_by_name=True)
 
-    model_config = ConfigDict(validate_by_name = True)
 
-def generate_gemini_compatible_schema(model: BaseModel) -> Dict[str, any]:
-    schema = {
-        "type": "object",
-        "properties": {},
-        "required": []
-    }
+class GenerateMolecularSubtypeLists(BaseModel):
+    cancer_name: str
+    molecular_subtypes: List[str]
+    model_config = ConfigDict(validate_by_name=True)
 
-    model_schema = model.model_json_schema()
 
-    for field_name, field_info in model_schema.get("properties", {}).items():
-        field_type = field_info.get("type")
-        if field_type == "array":
-            schema["properties"][field_name] = {
-                "type": "array",
-                "items": {"type": field_info["items"]["type"]}
-            }
-        elif field_type == "object":
-            nested_props = field_info.get("properties", {})
-            nested_required = field_info.get("required", [])
-            schema["properties"][field_name] = {
-                "type": "object",
-                "properties": {
-                    k: {"type": v["type"]} for k, v in nested_props.items()
-                },
-                "required": nested_required
-            }
+def generate_json_schema(model: BaseModel) -> Dict[str, Any]:
+    schema = {"type": "object", "properties": {}, "required": []}
+
+    fields = model.model_fields if hasattr(model, "model_fields") else model.__fields__
+
+    for field_name, field in fields.items():
+        field_type = field.annotation
+
+        if hasattr(field_type, "__origin__") and field_type.__origin__ is list:
+            list_arg = get_args(field_type)[0]
+            if isinstance(list_arg, type) and issubclass(list_arg, BaseModel):
+                nested_schema = generate_json_schema(list_arg)
+                schema["properties"][field_name] = {
+                    "type": "array",
+                    "items": nested_schema,
+                }
+            else:
+                schema["properties"][field_name] = {
+                    "type": "array",
+                    "items": {"type": "string"},
+                }
+
+        elif isinstance(field_type, type) and issubclass(field_type, BaseModel):
+            schema["properties"][field_name] = generate_json_schema(field_type)
+
         else:
-            schema["properties"][field_name] = {"type": field_type}
+            schema["properties"][field_name] = {"type": "string"}
 
-    schema["required"] = model_schema.get("required", [])
+    schema["required"] = list(fields.keys())
     return schema
 
-# Auto-generate JSON schema from the Pydantic model
-SCHEMA_JSON = generate_gemini_compatible_schema(GenerateLists)
-TEMPERATURE = 0.25
 
-PROMPT_TEMPLATE = """Based on scientific literature in PubMed, current genetic testing practices in oncology clinics, gene-disease association curations in ClinGen, OMIM, GeneReviews, and similar expert or peer reviewed resoursces,
-and public tumor sequencing databases such as cBioPortal, and COSMIC, list the genes
-and pathways, mutations in which are associated with {cancer_name} ({oncotree_code}).
-Different ontologies have different terms/codes to depict the same cancer sub-type.
-{oncotree_code} is the OncoTree code that is the same as {ncit_code} (NCIt) and {umls_code} (UMLS).
-Use these codes to gather as much literature/data as possible to provide a comprehensive list
-of genes and pathways in JSON structured format. The associated gene list should be ranked by strength and likelihood of association such that the first gene in the list has the strongest association with the cancer type and the last gene in the list has the weakest association with the cancer type. The gene list should be of high quality, accurate, and should not exceed 50 in count. The JSON should have top-level keys:
-"oncotree_code", "cancer_name" (full name of the code), "other_codes_used_for_data_gathering" (dictionary with keys NCIt and UMLS), "associated_genes" (a list of gene symbols), and "associated_pathways" (a dictionary with keys being each pathway name in the list: ['prostate_cancer_ar_signaling',
- 'prostate_cancer_ar_and_steroid_synthesis_enzymes',
- 'prostate_cancer_steroid_inactivating_genes',
- 'prostate_cancer_down_regulated_by_androgen',
- 'glioblastoma_tp53_pathway',
- 'glioblastoma_rtk_ras_pi3k_akt_signaling',
- 'glioblastoma_rb_pathway',
- 'general_cell_cycle_tcga_pancan_pathways',
- 'general_hippo_tcga_pancan_pathways',
- 'general_myc_tcga_pancan_pathways',
- 'general_notch_tcga_pancan_pathways',
- 'general_nrf2_tcga_pancan_pathways',
- 'general_pi3k_tcga_pancan_pathways',
- 'general_tgf_beta_tcga_pancan_pathways',
- 'general_rtk_ras_tcga_pancan_pathways',
- 'general_tp53_tcga_pancan_pathways',
- 'general_wnt_tcga_pancan_pathways',
- 'general_cell_cycle_control',
- 'general_p53_signaling',
- 'general_notch_signaling',
- 'general_dna_damage_response',
- 'general_other_growth_proliferation_signaling',
- 'general_survival_cell_death_regulation_signaling',
- 'general_telomere_maintenance',
- 'general_rtk_signaling_family',
- 'general_pi3k_akt_mtor_signaling',
- 'general_ras_raf_mek_erk_jnk_signaling',
- 'general_angiogenesis',
- 'general_folate_transport',
- 'general_invasion_and_metastasis',
- 'general_tgf_β_pathway',
- 'ovarian_cancer_oncogenes_associated_with_epithelial_ovarian_cancer',
- 'ovarian_cancer_putative_tumor_suppressor_genes_in_epithelial_ovarian_cancer',
- 'general_regulation_of_ribosomal_protein_synthesis_and_cell_growth'] and the value being 'yes' if associated with cancer sub-type or 'no' if pathway not associated with cancer sub-type)."""
+schema_json_genes = generate_json_schema(GenerateGeneLists)
+schema_json_pathways = generate_json_schema(GeneratePathwayLists)
+schema_json_molecularsubtypes = generate_json_schema(GenerateMolecularSubtypeLists)
+
+
+PROMPT_TEMPLATE_GENES = """You are an expert in clinical cancer genetics ...
+Return **strict JSON** without trailing commas, unescaped quotes, or comments. Ensure it parses with `json.loads()`."""
+
+
+PROMPT_TEMPLATE_PATHWAYS = """You are an expert in clinical cancer genetics ...
+Return **strict JSON** without trailing commas, unescaped quotes, or comments. Ensure it parses with `json.loads()`."""
+
+
+PROMPT_TEMPLATE_MOLECULARSUBTYPES = """You are an expert in clinical cancer genetics ...
+Return **strict JSON** without trailing commas, unescaped quotes, or comments. Ensure it parses with `json.loads()`."""
+
+
+def retry_with_backoff(func, max_retries=5, base_delay=1, jitter=True):
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except Exception as e:
+            wait_time = base_delay * (2**attempt)
+            if jitter:
+                wait_time += random.uniform(0, 1)
+            typer.echo(
+                f"ERROR: Attempt {attempt+1} failed: {e}. Retrying in {wait_time:.2f}s..."
+            )
+            time.sleep(wait_time)
+    raise Exception(f"Failed after {max_retries} retries")
+
+
+def call_llm_with_retry(model, messages, temperature):
+    def api_call():
+        return completion(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+        )
+
+    return retry_with_backoff(api_call, max_retries=5, base_delay=1)
+
+
+def try_parse_json(output: str) -> dict:
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", output, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        raise
+
+
+def repair_with_llm(broken_output: str, llm_model: str) -> dict:
+    repair_prompt = f"""
+    The following JSON is invalid or malformed. Please fix it and return only valid JSON:
+
+    {broken_output}
+    """
+    response = call_llm_with_retry(
+        model=llm_model,
+        messages=[{"role": "user", "content": repair_prompt}],
+        temperature=0,
+    )
+    fixed = response.choices[0].message.content
+    return try_parse_json(fixed)
 
 
 app = typer.Typer()
 
+
 @app.command()
-def generate_lists(input_oncotree: Path = typer.Option(..., "--input_oncotree_filepath", "-i", help="Path to the OncoTree JSON file")):
-    typer.echo(f"Input file path: {input_oncotree}")
+def generate_lists(
+    input_oncotree: Path = typer.Option(
+        ..., "--input_oncotree_filepath", "-i"
+    ),
+    output_lists: Path = typer.Option(
+        ..., "--output_filepath", "-o"
+    ),
+    llm_model: str = typer.Option(
+        "gpt-4o-mini",
+        "--model_name",
+        "-m",
+    ),
+    temperature: float = typer.Option(
+        0.25,
+        "--input_LLM_temperature",
+        "-t",
+    ),
+    codes: List[str] = typer.Option(
+        None,
+        "--codes",
+        "-c",
+    ),
+    all_codes: bool = typer.Option(
+        False,
+        "--all",
+        "-a",
+    ),
+    genes_flag: bool = typer.Option(False, "--genes", "-g"),
+    pathways_flag: bool = typer.Option(False, "--pathways", "-p"),
+    molecular_flag: bool = typer.Option(False, "--molecular", "-ms"),
+):
+    if not any([genes_flag, pathways_flag, molecular_flag]):
+        typer.echo(
+            "ERROR: You must specify at least one of --genes, --pathways, or --molecular"
+        )
+        raise typer.Exit(code=1)
 
     if not input_oncotree.exists():
-        typer.echo(f"File not found: {input_oncotree}")
+        typer.echo(f"INFO: File not found: {input_oncotree}")
         raise typer.Exit(code=1)
 
     with input_oncotree.open("r") as f:
         oncotree = json.load(f)
 
-    # Initialize the output dictionary
+    if all_codes:
+        target_codes = {item["code"] for item in oncotree}
+    elif codes:
+        target_codes = set(codes)
+    else:
+        target_codes = {"COAD", "NSCLC", "PAAD", "DSRCT", "BRCA", "MNM"}
+
     oncotree_codes_info = {}
-
     for item in oncotree:
-        if item["code"]=="COAD" or item["code"]=="NSCLC" or item["code"]=="PAAD":
-            code = item["code"]
-            name = item["name"]
-            umls = item["externalReferences"]["UMLS"][0] if "UMLS" in item["externalReferences"] else None
-            ncit = item["externalReferences"]["NCI"][0] if "NCI" in item["externalReferences"] else None
-        
-            # Add the extracted information to the output dictionary
-            oncotree_codes_info[code] = {
-                "name": name,
-                "NCIt": ncit,
-                "UMLS": umls
-            }
+        if item["code"] not in target_codes:
+            continue
+        code = item["code"]
+        name = item["name"]
+        umls = item.get("externalReferences", {}).get("UMLS", [None])[0]
+        ncit = item.get("externalReferences", {}).get("NCI", [None])[0]
+        oncotree_codes_info[code] = {"name": name, "NCIt": ncit, "UMLS": umls}
 
-    
+    if not oncotree_codes_info:
+        typer.echo("ERROR: No matching OncoTree codes found.")
+        raise typer.Exit(code=1)
 
-    generation_config = GenerationConfig(
-        temperature=TEMPERATURE,
-        response_mime_type="application/json",  # Ask Gemini to output JSON directly
-        response_schema= SCHEMA_JSON
+    all_results = {}
+    total = len(oncotree_codes_info)
 
-    )
+    for idx, (oncotree_code, details) in enumerate(
+        oncotree_codes_info.items(), start=1
+    ):
+        typer.echo(f"[{idx}/{total}] Processing {oncotree_code}...")
 
-    model = genai.GenerativeModel(
-        model_name='gemini-2.0-flash', #Knowledge cutoff date is June 2024
-        generation_config=generation_config
-    )
+        if genes_flag:
+            current_prompt = PROMPT_TEMPLATE_GENES.format(
+                cancer_name=details["name"],
+                oncotree_code=oncotree_code,
+                ncit_code=details["NCIt"],
+                umls_code=details["UMLS"],
+            )
 
-    all_results = {} # A dictionary to store all the AI's answers
+            try:
+                response = call_llm_with_retry(
+                    model=llm_model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "Return only strict JSON.",
+                        },
+                        {"role": "user", "content": current_prompt},
+                    ],
+                    temperature=temperature,
+                )
 
-    for oncotree_code, details in oncotree_codes_info.items():
-        # Fill in the placeholders in the prompt template
-        current_prompt = PROMPT_TEMPLATE.format(
-            cancer_name=details['name'],
-            oncotree_code=oncotree_code,
-            ncit_code=details['NCIt'],
-            umls_code=details['UMLS'],
-        )
-    
-        # Send the question to the AI
-        try:
-            response = model.generate_content(current_prompt)
-            #json_output_str = response.text
-            
-            # Convert the JSON string into a Python dictionary
-            parsed_json_data_dict = json.loads(response.text)
-            parsed_model = GenerateLists(**parsed_json_data_dict)
+                raw_output = response.choices[0].message.content
 
-            # Store the structured data
-            all_results[oncotree_code] = parsed_model.model_dump()
+                try:
+                    parsed_json = try_parse_json(raw_output)
+                except Exception:
+                    parsed_json = repair_with_llm(raw_output, llm_model)
 
-      
-        except Exception as e:
-            print(f"  Error processing {oncotree_code}: {e}")
-            # Log errors, and check response for more details if available
-            if 'response' in locals() and hasattr(response, 'prompt_feedback'):
-                print(f"    Prompt Feedback: {response.prompt_feedback}")
-            if 'response' in locals() and hasattr(response, 'candidates') and response.candidates:
-                print(f"    Candidate Finish Reason: {response.candidates[0].finish_reason}")
-                if response.candidates[0].finish_reason.name == 'SAFETY':
-                    print(f"    Safety Ratings: {response.candidates[0].safety_ratings}")
-            all_results[oncotree_code] = {"error": str(e), "details_provided": details}
+                parsed_model = GenerateGeneLists(**parsed_json)
 
-    print(all_results)
+                all_results.setdefault("genes", {})[
+                    oncotree_code
+                ] = parsed_model.model_dump()
 
-    with open("gene_pathway_lists/export_lists.json", "w") as f:
+            except Exception as e:
+                typer.echo(f"ERROR: {oncotree_code}: {e}")
+
+        time.sleep(2)
+
+    with open(output_lists, "w") as f:
         json.dump(all_results, f, indent=2)
+
 
 if __name__ == "__main__":
     app()
